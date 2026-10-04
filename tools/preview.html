@@ -1,0 +1,136 @@
+<!doctype html>
+<!--
+  Preview the card without Home Assistant, using made-up dish states and history.
+
+  Open in a browser after running tools/build.py. With no query string it shows every dish, then every
+  state. To show one card: preview.html?model=mini&state=online&width=520
+  (model can also be a hardware version, e.g. hw=rev4_panda_prod2, to try the detection)
+-->
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <title>Starlink dish card preview</title>
+  <style>
+    body { margin: 0; padding: 24px; background: #111214; font: 13px -apple-system, BlinkMacSystemFont, Inter, Roboto, sans-serif; color: #9a9ea5; }
+    body.single { padding: 0; background: transparent; }
+    h2 { font-weight: 500; color: #d9dbde; margin: 28px 0 10px; }
+    .grid { display: flex; flex-wrap: wrap; gap: 18px; }
+    .cell p { margin: 0 0 6px; }
+  </style>
+  <script src="../dist/starlink-dish-card.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const SCENARIOS = {
+  online:   { label: 'Online', conn: 'on', down: 182.4, up: 21.7, ping: 26, power: 42 },
+  quiet:    { label: 'Online, quiet', conn: 'on', down: 2.6, up: 0.7, ping: 24, power: 38 },
+  heating:  { label: 'Snow melt on', conn: 'on', heating: 'on', down: 64.1, up: 9.2, ping: 31, power: 96 },
+  alerts:   { label: 'Obstructed, update ready', conn: 'on', obstructed: 'on', update: 'on', down: 41.3, up: 6.4, ping: 48, drop: 2.4, power: 44 },
+  sleeping: { label: 'Sleeping', conn: 'on', sleep: 'on', down: 0, up: 0, power: 9 },
+  stowed:   { label: 'Stowed', conn: 'off', stowed: 'on', power: 7 },
+  offline:  { label: 'Offline', conn: 'unavailable' },
+};
+const MODELS = ['standard_4x', 'v5', 'mini', 'standard_actuated', 'performance_gen_3', 'performance_gen_2',
+                'performance_gen_1', 'enterprise', 'standard_circular'];
+const DEVICE = 'dev_starlink';
+
+// the entities the integration creates, as Home Assistant's frontend describes them
+const ENTITIES = [
+  ['binary_sensor.starlink_connectivity', null, 'connectivity', 'conn'],
+  ['binary_sensor.starlink_sleep', 'power_save_idle', null, 'sleep'],
+  ['binary_sensor.starlink_heating', 'heating', null, 'heating'],
+  ['binary_sensor.starlink_obstructed', 'currently_obstructed', 'problem', 'obstructed'],
+  ['binary_sensor.starlink_thermal_throttle', 'thermal_throttle', 'problem', 'throttle'],
+  ['binary_sensor.starlink_motors_stuck', 'motors_stuck', 'problem', 'motors'],
+  ['binary_sensor.starlink_mast_near_vertical', 'mast_near_vertical', 'problem', 'mast'],
+  ['binary_sensor.starlink_ethernet_speeds', 'slow_ethernet', 'problem', 'ethernet'],
+  ['binary_sensor.starlink_unexpected_location', 'unexpected_location', 'problem', 'location'],
+  ['binary_sensor.starlink_roaming_mode', 'roaming', null, 'roaming'],
+  ['binary_sensor.starlink_update', null, 'update', 'update'],
+  ['switch.starlink_stowed', 'stowed', 'switch', 'stowed'],
+  ['sensor.starlink_downlink_throughput', 'downlink_throughput', 'data_rate', 'down', 'Mbit/s'],
+  ['sensor.starlink_uplink_throughput', 'uplink_throughput', 'data_rate', 'up', 'Mbit/s'],
+  ['sensor.starlink_ping', 'ping', null, 'ping', 'ms'],
+  ['sensor.starlink_ping_drop_rate', 'ping_drop_rate', null, 'drop', '%'],
+  ['sensor.starlink_last_restart', 'last_restart', 'timestamp', 'restart'],
+  ['sensor.starlink_power', null, 'power', 'power', 'W'],
+];
+
+// made-up but plausible history: a wandering line with the odd spike
+function history(base, spikes, seed) {
+  let s = seed; const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647;
+  const now = Date.now() / 1000, out = [];
+  for (let i = 0; i <= 360; i++) {
+    let v = base * (0.75 + rnd() * 0.5);
+    if (rnd() < spikes) v *= 2 + rnd() * 3;
+    out.push({ s: String(v), lu: now - 3600 + i * 10 });
+  }
+  return out;
+}
+
+function fakeHass(sc, hw) {
+  const states = {}, entities = {};
+  for (const [id, tk, dc, key, unit] of ENTITIES) {
+    let state = sc[key];
+    if (key === 'restart') state = new Date(Date.now() - (18 * 60 + 10) * 60000).toISOString();
+    if (key === 'drop') state = sc.conn === 'on' ? (sc.drop || 0) : undefined;
+    if (state === undefined) state = ['down', 'up', 'ping', 'drop', 'power'].includes(key) ? 'unavailable' : 'off';
+    if (sc.conn === 'unavailable') state = 'unavailable';
+    states[id] = { entity_id: id, state: String(state), attributes: { ...(dc ? { device_class: dc } : {}), ...(unit ? { unit_of_measurement: unit } : {}) } };
+    entities[id] = { entity_id: id, device_id: DEVICE, platform: 'starlink', ...(tk ? { translation_key: tk } : {}) };
+  }
+  const busy = sc.down > 20;
+  return {
+    states, entities,
+    devices: { [DEVICE]: { id: DEVICE, manufacturer: 'SpaceX', model: 'Starlink', hw_version: hw || 'rev4_panda_prod2' } },
+    callWS: async () => sc.conn === 'on' ? {
+      'sensor.starlink_downlink_throughput': history(busy ? 60 : 1.8, 0.03, 11),
+      'sensor.starlink_uplink_throughput': history(busy ? 9 : 0.5, 0.02, 23),
+      'sensor.starlink_ping': history(26, 0.03, 37),
+    } : {},
+  };
+}
+
+function card(config, scenario, width, hw) {
+  const el = document.createElement('starlink-dish-card');
+  el.setConfig(config);
+  el.hass = fakeHass(SCENARIOS[scenario], hw);
+  el.style.width = `${width}px`;
+  return el;
+}
+
+const q = new URLSearchParams(location.search);
+const root = document.getElementById('root');
+if (q.has('state')) {
+  document.body.classList.add('single');
+  const el = card({ model: q.get('model') || 'auto' }, q.get('state'), Number(q.get('width') || 520), q.get('hw'));
+  el.id = 'card';
+  root.appendChild(el);
+} else {
+  const section = (title) => {
+    const h = document.createElement('h2'); h.textContent = title; root.appendChild(h);
+    const grid = document.createElement('div'); grid.className = 'grid'; root.appendChild(grid); return grid;
+  };
+  let grid = section('Every dish');
+  for (const m of MODELS) {
+    const cell = document.createElement('div'); cell.className = 'cell';
+    const p = document.createElement('p'); p.textContent = m; cell.appendChild(p);
+    cell.appendChild(card({ model: m }, 'online', 420)); grid.appendChild(cell);
+  }
+  grid = section('Every state (Standard 4X)');
+  for (const s of Object.keys(SCENARIOS)) {
+    const cell = document.createElement('div'); cell.className = 'cell';
+    const p = document.createElement('p'); p.textContent = SCENARIOS[s].label; cell.appendChild(p);
+    cell.appendChild(card({ model: 'standard_4x' }, s, 420)); grid.appendChild(cell);
+  }
+  grid = section('Detected from the hardware version');
+  for (const hw of ['rev1_production', 'rev2_proto4', 'rev3_proto2', 'rev4_panda_prod2', 'rev5_pez_prod2', 'mini1_panda_prod2', 'rev_hp1_proto2', 'something_new']) {
+    const cell = document.createElement('div'); cell.className = 'cell';
+    const p = document.createElement('p'); p.textContent = hw; cell.appendChild(p);
+    cell.appendChild(card({ model: 'auto' }, 'online', 320, hw)); grid.appendChild(cell);
+  }
+}
+</script>
+</body>
+</html>

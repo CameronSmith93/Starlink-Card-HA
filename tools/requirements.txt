@@ -1,0 +1,4 @@
+# for tools/make_dishes.py (tools/build.py needs only Python 3.8+)
+numpy>=1.24
+opencv-python-headless>=4.8
+pillow>=10.0
