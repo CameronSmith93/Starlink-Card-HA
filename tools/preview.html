@@ -30,7 +30,12 @@ const SCENARIOS = {
   sleeping: { label: 'Sleeping', conn: 'on', sleep: 'on', down: 0, up: 0, power: 9 },
   stowed:   { label: 'Stowed', conn: 'off', stowed: 'on', power: 7 },
   offline:  { label: 'Offline', conn: 'unavailable' },
+  drops:    { label: 'Dropping out', conn: 'on', down: 3.7, up: 0.7, ping: 27, drop: 5, power: 17, drops: true },
+  down_now: { label: 'Dropped out now', conn: 'off', down: 0, up: 0, drop: 100, power: 16, drops: true, since: 23 },
 };
+
+// made-up drops, as [minutes ago, seconds long, obstructed]
+const DROPS = [[392, 12], [171, 21, true], [51, 13], [49.6, 16], [48.4, 47], [12.3, 15], [11.4, 36], [10.6, 16], [5.2, 46], [3.1, 16]];
 const MODELS = ['standard_4x', 'v5', 'mini', 'standard_actuated', 'performance_gen_3', 'performance_gen_2',
                 'performance_gen_1', 'enterprise', 'standard_circular'];
 const DEVICE = 'dev_starlink';
@@ -69,26 +74,62 @@ function history(base, spikes, seed) {
   return out;
 }
 
+// the connectivity sensor's history for the drops above (and one under way, for down_now)
+function connHistory(sc) {
+  const now = Date.now() / 1000, out = [{ s: 'on', lu: now - 86400 }];
+  for (const [ago, len] of DROPS) { out.push({ s: 'off', lu: now - ago * 60 }, { s: 'on', lu: now - ago * 60 + len }); }
+  if (sc.since) out.push({ s: 'off', lu: now - sc.since });
+  return out;
+}
+
+// ping drop rate: mostly nothing, a few small blips, 100 % through each drop
+function dropHistory(sc) {
+  const now = Date.now() / 1000, out = [];
+  let s = 5; const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647;
+  for (let t = now - 3600; t <= now; t += 10) {
+    const inDrop = DROPS.some(([ago, len]) => t >= now - ago * 60 && t < now - ago * 60 + len) || (sc.since && t >= now - sc.since);
+    out.push({ s: String(inDrop ? 100 : rnd() < 0.06 ? 5 + Math.round(rnd() * 25) : 0), lu: t });
+  }
+  return out;
+}
+
 function fakeHass(sc, hw) {
   const states = {}, entities = {};
+  const changed = new Date(Date.now() - (sc.since ? sc.since * 1000 : 18 * 60000)).toISOString();
   for (const [id, tk, dc, key, unit] of ENTITIES) {
     let state = sc[key];
     if (key === 'restart') state = new Date(Date.now() - (18 * 60 + 10) * 60000).toISOString();
-    if (key === 'drop') state = sc.conn === 'on' ? (sc.drop || 0) : undefined;
+    if (key === 'drop') state = sc.conn === 'on' || sc.drop !== undefined ? (sc.drop || 0) : undefined;
     if (state === undefined) state = ['down', 'up', 'ping', 'drop', 'power'].includes(key) ? 'unavailable' : 'off';
     if (sc.conn === 'unavailable') state = 'unavailable';
-    states[id] = { entity_id: id, state: String(state), attributes: { ...(dc ? { device_class: dc } : {}), ...(unit ? { unit_of_measurement: unit } : {}) } };
+    states[id] = { entity_id: id, state: String(state), last_changed: changed, last_updated: changed,
+                   attributes: { ...(dc ? { device_class: dc } : {}), ...(unit ? { unit_of_measurement: unit } : {}) } };
     entities[id] = { entity_id: id, device_id: DEVICE, platform: 'starlink', ...(tk ? { translation_key: tk } : {}) };
   }
   const busy = sc.down > 20;
   return {
     states, entities,
     devices: { [DEVICE]: { id: DEVICE, manufacturer: 'SpaceX', model: 'Starlink', hw_version: hw || 'rev4_panda_prod2' } },
-    callWS: async () => sc.conn === 'on' ? {
-      'sensor.starlink_downlink_throughput': history(busy ? 60 : 1.8, 0.03, 11),
-      'sensor.starlink_uplink_throughput': history(busy ? 9 : 0.5, 0.02, 23),
-      'sensor.starlink_ping': history(26, 0.03, 37),
-    } : {},
+    locale: { language: 'en-AU', time_format: 'language' },
+    callWS: async (msg) => {
+      if (sc.conn === 'unavailable') return {};
+      const want = (msg && msg.entity_ids) || [];
+      const all = {
+        'sensor.starlink_downlink_throughput': history(busy ? 60 : 1.8, 0.03, 11),
+        'sensor.starlink_uplink_throughput': history(busy ? 9 : 0.5, 0.02, 23),
+        'sensor.starlink_ping': history(26, 0.03, 37),
+        'sensor.starlink_ping_drop_rate': sc.drops ? dropHistory(sc) : [{ s: String(sc.drop || 0), lu: Date.now() / 1000 - 3600 }],
+        'binary_sensor.starlink_connectivity': sc.drops ? connHistory(sc) : [{ s: sc.conn, lu: Date.now() / 1000 - 86400 }],
+        'binary_sensor.starlink_obstructed': sc.drops
+          ? [{ s: 'off', lu: Date.now() / 1000 - 86400 }, { s: 'on', lu: Date.now() / 1000 - 171 * 60 - 5 }, { s: 'off', lu: Date.now() / 1000 - 171 * 60 + 30 }]
+          : [{ s: sc.obstructed || 'off', lu: Date.now() / 1000 - 86400 }],
+        'binary_sensor.starlink_sleep': [{ s: sc.sleep || 'off', lu: Date.now() / 1000 - 86400 }],
+        'switch.starlink_stowed': [{ s: sc.stowed || 'off', lu: Date.now() / 1000 - 86400 }],
+      };
+      const out = {};
+      for (const id of want) if (all[id]) out[id] = all[id];
+      return out;
+    },
   };
 }
 

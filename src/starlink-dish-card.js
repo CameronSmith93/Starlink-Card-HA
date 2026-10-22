@@ -4,7 +4,8 @@
  *
  * Your Starlink dish under a night sky, in a DIN typeface like Starlink's (D-DIN), with what it reports:
  * online, sleeping, stowed or offline; live throughput and latency; the last hour as two small
- * graphs; and any alerts. Driven by Home Assistant's built-in Starlink integration.
+ * graphs; outages (each drop, time offline and ping success); and any alerts. Driven by Home
+ * Assistant's built-in Starlink integration.
  *
  * The card shows the right dish for your kit: it reads the dish's hardware version from Home
  * Assistant, or you can choose the model yourself.
@@ -12,7 +13,7 @@
  * D-DIN is by Datto, under the SIL Open Font Licence 1.1. The dish photos are Starlink's.
  */
 (() => {
-  const STARLINK_CARD_VERSION = '1.0.0';
+  const STARLINK_CARD_VERSION = '1.1.0';
   const REPO = 'https://github.com/CameronSmith93/Starlink-Card-HA';
 
   // One photo per dish shape (inlined by tools/build.py).
@@ -177,6 +178,29 @@
     .chip { font-size: max(9px, 1.75cqw); padding: 1cqw 1.8cqw; border: 1px solid rgba(255,255,255,.18); border-radius: 99px; color: #bdbdbd; white-space: nowrap; }
     .chip.warn { border-color: rgba(255,176,32,.6); color: #ffb020; }
     .chip.info { border-color: rgba(120,170,255,.5); color: #9cc0ff; }
+    .chip.bad { border-color: rgba(255,69,58,.6); color: #ff6b61; }
+    .chip.live { animation: pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity: .5; } }
+
+    /* outages: drops, time offline and ping success, the ping-success graph, and the latest drops */
+    .outage { position: relative; margin: 3.6cqw 5cqw 0; padding-top: 3cqw; border-top: 1px solid rgba(255,255,255,.1); }
+    .outage[hidden] { display: none; }
+    .o-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .o-head .o-range { font-size: max(8px, 1.6cqw); color: #6f6f6f; }
+    .o-stats { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 1.8cqw; }
+    .o-stats > div { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+    .o-stats > div + div { padding-left: 3cqw; border-left: 1px solid rgba(255,255,255,.1); }
+    .o-stats .v { font-size: max(16px, 4.4cqw); }
+    .o-stats .v.bad { color: #ff6b61; }
+    .chart.c-drop { margin-top: 2.6cqw; }
+    .chart.c-drop svg { height: 8cqw; margin-top: 0; }
+    .chart .legend i.ok { border-top: 2px solid #fff; }
+    .chart .legend i.bad { border-top: 0; height: 1.3cqw; width: 1.8cqw; background: rgba(255,69,58,.55); vertical-align: -.05em; }
+    .o-list { margin-top: 2.6cqw; display: grid; gap: 1.4cqw; }
+    .o-row { display: grid; grid-template-columns: 13cqw 1fr auto; align-items: center; gap: 2cqw; font-size: max(10px, 2.1cqw); color: #c9c9c9; }
+    .o-row .o-t { color: #8a8a8a; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .o-row .chip { justify-self: end; }
+    .o-none, .o-more { font-size: max(9px, 1.8cqw); color: #7c7c7c; }
   `;
 
   class StarlinkDishCard extends HTMLElement {
@@ -192,11 +216,14 @@
             ...Object.entries(MODELS).map(([value, m]) => ({ value, label: m.name })),
           ] } } },
           { name: 'history_minutes', selector: { number: { min: 10, max: 1440, step: 5, mode: 'box', unit_of_measurement: 'min' } } },
+          { name: 'show_outages', selector: { boolean: {} } },
+          { name: 'outage_hours', selector: { number: { min: 1, max: 168, step: 1, mode: 'box', unit_of_measurement: 'h' } } },
         ],
-        computeLabel: (f) => ({ device: 'Starlink', model: 'Dish', history_minutes: 'Graph history' })[f.name],
+        computeLabel: (f) => ({ device: 'Starlink', model: 'Dish', history_minutes: 'Graph history', show_outages: 'Show outages', outage_hours: 'Outage history' })[f.name],
         computeHelper: (f) => ({
           device: 'Leave empty to use the first Starlink Home Assistant finds',
           history_minutes: 'How far back the graphs go (an hour if left empty)',
+          outage_hours: 'How far back drops are counted and listed (a day if left empty)',
           model: 'Which picture and name to show. Detecting can\'t tell kits that share a dish apart (Standard 4 and 4X, for example), so choose yours if you want its exact name.',
         })[f.name],
       };
@@ -207,6 +234,11 @@
       this._config = { model: 'auto', history_minutes: 60, ...config };
       const mins = Number(this._config.history_minutes);
       this._minutes = Number.isFinite(mins) && mins >= 5 ? Math.round(mins) : 60;
+      const hrs = Number(this._config.outage_hours);
+      this._outageHours = Number.isFinite(hrs) && hrs >= 1 ? Math.min(Math.round(hrs), 168) : 24;
+      this._showOutages = this._config.show_outages !== false;
+      this._live = [];      // connectivity changes seen since the last history load
+      this._lastLoad = 0;
       const m = slug(this._config.model || 'auto');
       this._model = m === 'auto' ? 'auto' : (MODELS[m] ? m : MODEL_ALIASES[m] || null);
       this._customLabel = this._model ? null : String(this._config.model);   // a name we don't know: show it as given
@@ -222,6 +254,13 @@
       const first = !this._hass;
       if (!this._hass || hass.entities !== this._hass.entities || hass.devices !== this._hass.devices) this._ents = null;
       this._hass = hass;
+      // Keep every connectivity change as it happens, so a drop shows up straight away rather than
+      // at the next history load.
+      const c = hass.states[this._id('connectivity')];
+      if (c && this._connSeen && c.state !== this._connSeen.state) {
+        this._live.push([new Date(c.last_changed).getTime(), c.state]);
+      }
+      this._connSeen = c;
       this._update();
       if (first) this._loadHistory();
     }
@@ -231,7 +270,10 @@
       this._hist = setInterval(() => this._loadHistory(), 60000);
       if (this._hass) this._loadHistory();
     }
-    disconnectedCallback() { clearInterval(this._tick); clearInterval(this._hist); }
+    disconnectedCallback() {
+      clearInterval(this._tick); clearInterval(this._hist); clearInterval(this._fast);
+      this._fast = null;
+    }
 
     // Work out the Starlink device and its entities.
     _resolve() {
@@ -310,6 +352,19 @@
                 <svg viewBox="0 0 100 30" preserveAspectRatio="none"></svg>
                 <div class="foot legend caps"><span class="ago"></span><span>Now</span></div></div>
             </div>
+            <div class="outage" ${this._showOutages ? '' : 'hidden'}>
+              <div class="o-head"><span class="k caps">Outages</span><span class="legend caps o-range"></span></div>
+              <div class="o-stats">
+                <div data-more="connectivity"><div class="k caps">Drops</div><div class="v o-count"></div></div>
+                <div data-more="connectivity"><div class="k caps">Offline</div><div class="v o-down"></div></div>
+                <div data-more="ping_drop_rate"><div class="k caps o-ping-k">Ping success</div><div class="v o-ping"></div></div>
+              </div>
+              <div class="chart c-drop">
+                <svg viewBox="0 0 100 30" preserveAspectRatio="none"></svg>
+                <div class="foot legend caps"><span class="ago"></span><span><i class="ok"></i>Ping success<i class="bad"></i>Offline</span><span>Now</span></div>
+              </div>
+              <div class="o-list"></div>
+            </div>
             <div class="chips"></div>
           </div></div>
         </ha-card>`;
@@ -319,8 +374,11 @@
         this.dispatchEvent(ev);
       }));
       const m = this._minutes, h = m / 60;
-      const ago = m < 60 ? `${m} min ago` : Number.isInteger(h) ? `${h} ${h === 1 ? 'hr' : 'hrs'} ago` : `${h.toFixed(1)} hrs ago`;
-      this.shadowRoot.querySelectorAll('.ago').forEach((el) => { el.textContent = ago; });
+      const span = m < 60 ? `${m} min` : Number.isInteger(h) ? `${h} ${h === 1 ? 'hr' : 'hrs'}` : `${h.toFixed(1)} hrs`;
+      this.shadowRoot.querySelectorAll('.ago').forEach((el) => { el.textContent = `${span} ago`; });
+      const oh = this._outageHours;
+      this.shadowRoot.querySelector('.o-range').textContent = oh % 24 === 0 ? `Last ${oh === 24 ? 'day' : `${oh / 24} days`}` : `Last ${oh} ${oh === 1 ? 'hr' : 'hrs'}`;
+      this.shadowRoot.querySelector('.o-ping-k').textContent = `Ping success · ${span}`;
       this._shownDish = null;
     }
 
@@ -369,11 +427,23 @@
       }
 
       const up = this._uptime();
+      const outages = this._outages();
+      const ongoing = outages.find((o) => !o.end);
+      const last = outages.filter((o) => o.end).pop();
       let sub = '';
       if (!reachable) sub = 'Home Assistant can’t<br>reach the dish';
+      else if (ongoing && mode === 'off') sub = `No internet for<br>${this._dur(Date.now() - ongoing.start)}`;
       else if (heating) sub = 'Snow melt on' + (up ? `<br>Up ${up}` : '');
       else if (up) sub = `Up ${up}`;
+      // a drop in the last hour, under the up time
+      if (reachable && mode === '' && last && Date.now() - last.end < 3600000) {
+        sub += `${sub ? '<br>' : ''}Dropped ${this._ago(last.end)} · ${this._dur(last.end - last.start)}`;
+      }
       r.querySelector('.sub').innerHTML = sub;
+
+      // while it's down, count the seconds
+      if (ongoing && !this._fast) this._fast = setInterval(() => this._update(), 1000);
+      else if (!ongoing && this._fast) { clearInterval(this._fast); this._fast = null; }
 
       const show = (v, d) => (v === null || !reachable ? '–' : v.toFixed(d));
       const down = this._mbps('downlink'), upl = this._mbps('uplink');
@@ -396,6 +466,136 @@
       }
       r.querySelector('.chips').innerHTML = chips.join('');
       this._drawCharts();
+      this._drawOutages(outages);
+    }
+
+    // ---------- outages ----------
+
+    // Drops, from the connectivity sensor's history plus any changes seen since: each one runs from
+    // the dish losing its connection to getting it back. Time asleep or stowed isn't a drop.
+    _outages() {
+      if (!this._hass) return [];
+      const now = Date.now(), from = now - this._outageHours * 3600000;
+      const pts = (this._connHist || []).slice();
+      const lastHist = pts.length ? pts[pts.length - 1][0] : 0;
+      for (const p of this._live) if (p[0] > lastHist) pts.push(p);
+      const cur = this._st('connectivity');
+      if (cur) {
+        const t = new Date(cur.last_changed).getTime();
+        if (!pts.length || (pts[pts.length - 1][1] !== cur.state && t >= pts[pts.length - 1][0])) pts.push([t, cur.state]);
+      }
+      pts.sort((a, b) => a[0] - b[0]);
+      const quiet = this._quietHist || [];
+      const out = [];
+      let open = null;
+      for (const [t, s] of pts) {
+        if (s === 'unknown') continue;
+        const down = s === 'off' || s === 'unavailable';
+        if (down && !open) open = { start: t, unreachable: s === 'unavailable' };
+        else if (down && open && s === 'unavailable') open.unreachable = true;
+        else if (!down && open) { open.end = t; out.push(open); open = null; }
+      }
+      if (open) { open.end = null; out.push(open); }
+      const obstructed = this._obsHist || [];
+      return out.filter((o) => (o.end || now) > from && !quiet.some(([a, b]) => a < (o.end || now) && b > o.start)).map((o) => ({
+        ...o,
+        start: Math.max(o.start, from),
+        obstructed: obstructed.some(([a, b]) => a < (o.end || now) && b > o.start),
+      }));
+    }
+
+    _dur(ms) {
+      const s = Math.max(1, Math.round(ms / 1000));
+      if (s < 60) return `${s} s`;
+      const m = Math.floor(s / 60), r = s % 60;
+      if (m < 60) return r ? `${m} min ${r} s` : `${m} min`;
+      const h = Math.floor(m / 60), rm = m % 60;
+      return `${h} ${h === 1 ? 'hr' : 'hrs'}${rm ? ` ${rm} min` : ''}`;
+    }
+
+    _ago(t) {
+      const m = Math.round((Date.now() - t) / 60000);
+      if (m < 1) return 'just now';
+      if (m < 60) return `${m} min ago`;
+      const h = Math.floor(m / 60);
+      return `${h} ${h === 1 ? 'hr' : 'hrs'} ago`;
+    }
+
+    _clock(t) {
+      const loc = (this._hass && this._hass.locale) || {};
+      const lang = loc.language || (this._hass && this._hass.language) || undefined;
+      const opts = { hour: 'numeric', minute: '2-digit' };
+      if (loc.time_format === '12') opts.hour12 = true;
+      if (loc.time_format === '24') opts.hour12 = false;
+      const tz = this._hass && this._hass.config && loc.time_zone === 'server' ? this._hass.config.time_zone : undefined;
+      if (tz) opts.timeZone = tz;
+      const d = new Date(t), today = new Date();
+      if (d.toDateString() !== today.toDateString()) opts.weekday = 'short';
+      try { return new Intl.DateTimeFormat(lang, opts).format(d); } catch (e) { return d.toLocaleTimeString(); }
+    }
+
+    // ping success (100 % less the ping drop rate), weighted by how long each reading stood
+    _pingSuccess() {
+      const s = (this._series && this._series[3] || []).slice();
+      const cur = this._st('ping_drop_rate'), v = cur ? parseFloat(cur.state) : NaN;
+      if (Number.isFinite(v)) {
+        const t = new Date(cur.last_updated).getTime();
+        if (!s.length || t > s[s.length - 1][0]) s.push([t, v]);
+      }
+      if (!s.length) return null;
+      const end = Date.now(), start = end - this._minutes * 60000;
+      let acc = 0, dur = 0;
+      for (let i = 0; i < s.length; i++) {
+        const a = Math.max(s[i][0], start), b = Math.min(i + 1 < s.length ? s[i + 1][0] : end, end);
+        if (b > a) { acc += (100 - s[i][1]) * (b - a); dur += b - a; }
+      }
+      return dur ? acc / dur : null;
+    }
+
+    _drawOutages(outages) {
+      if (!this.shadowRoot || !this._showOutages) return;
+      const r = this.shadowRoot, now = Date.now();
+      const offMs = outages.reduce((a, o) => a + ((o.end || now) - o.start), 0);
+      const count = r.querySelector('.o-count');
+      count.innerHTML = `${outages.length}`;
+      count.classList.toggle('bad', outages.some((o) => !o.end));
+      r.querySelector('.o-down').innerHTML = offMs
+        ? this._dur(offMs).replace(/(\d+) (s|min|hrs?)/g, (m, n, u) => `${n}<small>${u.toUpperCase()}</small>`)
+        : '0<small>S</small>';
+      const ps = this._pingSuccess();
+      r.querySelector('.o-ping').innerHTML = ps === null ? '–' : `${ps >= 99.95 ? '100' : ps.toFixed(1)}<small>%</small>`;
+
+      // the latest drops, newest first (the one under way at the top)
+      const rows = outages.slice().reverse().slice(0, 5).map((o) => {
+        const what = o.unreachable ? 'No contact' : !o.end ? 'Offline now' : o.obstructed ? 'Obstructed' : 'Dropped';
+        const t = o.end ? this._clock(o.start) : 'Now';
+        return `<div class="o-row"><span class="o-t caps">${t}</span><span class="caps">${what}</span><span class="chip caps bad ${o.end ? '' : 'live'}">${this._dur((o.end || now) - o.start)}</span></div>`;
+      });
+      const more = outages.length - rows.length;
+      r.querySelector('.o-list').innerHTML = rows.length
+        ? rows.join('') + (more > 0 ? `<div class="o-more caps">And ${more} earlier</div>` : '')
+        : `<div class="o-none caps">No drops in that time</div>`;
+      this._drawDropChart(outages);
+    }
+
+    _drawDropChart(outages) {
+      const svg = this.shadowRoot.querySelector('.c-drop svg');
+      if (!svg) return;
+      const end = Date.now(), start = end - this._minutes * 60000, span = end - start;
+      const x = (t) => Math.min(Math.max((t - start) / span, 0), 1) * 100;
+      const grid = '<line x1="0" y1="30" x2="100" y2="30" stroke="rgba(255,255,255,.18)" stroke-width="1" vector-effect="non-scaling-stroke"/>'
+        + '<line x1="0" y1="3" x2="100" y2="3" stroke="rgba(255,255,255,.07)" stroke-width="1" vector-effect="non-scaling-stroke"/>';
+      const bands = outages.filter((o) => (o.end || end) > start).map((o) => {
+        const a = x(o.start), b = x(o.end || end);
+        return `<rect x="${a.toFixed(2)}" y="0" width="${Math.max(b - a, 0.35).toFixed(2)}" height="30" fill="rgba(255,69,58,.32)"/>`;
+      }).join('');
+      let line = '';
+      if (this._series && this._series[3] && this._series[3].length) {
+        const ok = this._buckets(this._series[3]).map((v) => (v === null ? null : 100 - v));
+        line = `<path d="${this._path(ok, 100, true)}" fill="rgba(255,255,255,.12)"/>`
+          + `<path d="${this._path(ok, 100)}" fill="none" stroke="#fff" stroke-width="1.4" vector-effect="non-scaling-stroke"/>`;
+      }
+      svg.innerHTML = grid + bands + line;
     }
 
     async _loadHistory() {
@@ -403,18 +603,44 @@
       if (this._lastLoad && Date.now() - this._lastLoad < 55000) return;
       this._loading = true;
       try {
-        const ids = ['downlink', 'uplink', 'ping'].map((k) => this._id(k));
+        const time = (p) => (p.lu !== undefined ? p.lu * 1000 : new Date(p.last_updated || p.last_changed).getTime());
+        const val = (p) => (p.s !== undefined ? p.s : p.state);
+        const ids = ['downlink', 'uplink', 'ping', 'ping_drop_rate'].map((k) => this._id(k));
         const res = await this._hass.callWS({
           type: 'history/history_during_period',
           start_time: new Date(Date.now() - this._minutes * 60000).toISOString(),
           entity_ids: ids, minimal_response: true, no_attributes: true, significant_changes_only: false,
         });
-        this._series = ids.map((id) => (res[id] || []).map((p) => [
-          (p.lu !== undefined ? p.lu * 1000 : new Date(p.last_updated || p.last_changed).getTime()),
-          parseFloat(p.s !== undefined ? p.s : p.state),
-        ]).filter(([, v]) => Number.isFinite(v)));
+        this._series = ids.map((id) => (res[id] || []).map((p) => [time(p), parseFloat(val(p))]).filter(([, v]) => Number.isFinite(v)));
+
+        // Outages look further back, and only need the on/off sensors.
+        if (this._showOutages) {
+          const now = Date.now();
+          const oids = ['connectivity', 'obstructed', 'sleep', 'stowed'].map((k) => this._id(k));
+          const ores = await this._hass.callWS({
+            type: 'history/history_during_period',
+            start_time: new Date(now - this._outageHours * 3600000).toISOString(),
+            entity_ids: oids, minimal_response: true, no_attributes: true, significant_changes_only: false,
+          });
+          const points = (id) => (ores[id] || []).map((p) => [time(p), val(p)]);
+          // spans where a sensor was on, as [start, end]
+          const spans = (id) => {
+            const out = []; let open = null;
+            for (const [t, s] of points(id)) {
+              if (s === 'on' && open === null) open = t;
+              else if (s !== 'on' && open !== null) { out.push([open, t]); open = null; }
+            }
+            if (open !== null) out.push([open, now]);
+            return out;
+          };
+          this._connHist = points(oids[0]);
+          this._obsHist = spans(oids[1]);
+          this._quietHist = [...spans(oids[2]), ...spans(oids[3])];
+          const lastHist = this._connHist.length ? this._connHist[this._connHist.length - 1][0] : 0;
+          this._live = this._live.filter((p) => p[0] > lastHist);
+        }
         this._lastLoad = Date.now();
-        this._drawCharts();
+        this._update();
       } catch (e) {
         // history isn't essential; leave the graphs empty
       } finally { this._loading = false; }
@@ -425,11 +651,13 @@
       const n = Math.min(this._minutes, 120), span = this._minutes * 60000 / n;
       const now = Date.now(), start = now - this._minutes * 60000;
       const sums = new Array(n).fill(0), counts = new Array(n).fill(0), out = new Array(n).fill(null);
+      let before = null;   // the reading standing when the window opens (a sensor that rarely changes may have none inside it)
       for (const [t, v] of series) {
         const i = Math.floor((t - start) / span);
-        if (i >= 0 && i < n) { sums[i] += v; counts[i]++; }
+        if (i < 0) before = v;
+        else if (i < n) { sums[i] += v; counts[i]++; }
       }
-      let last = null;
+      let last = before;
       for (let i = 0; i < n; i++) {
         if (counts[i]) last = sums[i] / counts[i];
         out[i] = counts[i] ? sums[i] / counts[i] : last;

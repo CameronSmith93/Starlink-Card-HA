@@ -22,6 +22,8 @@ const SHOTS = [
   ['snow-melt-performance.png', 'performance_gen_3', 'heating', 520],
   ['sleeping-actuated.png', 'standard_actuated', 'sleeping', 520],
   ['phone-v5.png', 'v5', 'quiet', 360],
+  ['outages-standard-4x.png', 'standard_4x', 'drops', 520],
+  ['offline-now-standard-4x.png', 'standard_4x', 'down_now', 520],
 ];
 
 (async () => {

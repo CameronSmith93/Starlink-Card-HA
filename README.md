@@ -2,8 +2,8 @@
 
 A card that shows your Starlink dish the way Starlink shows it: your dish, in Starlink's own product
 photo, under a night sky, in a DIN typeface like Starlink's. It tells you whether the dish is online, sleeping,
-stowed or offline, with live download, upload and latency, the last hour as two small graphs, and
-any alerts. It reads everything from Home Assistant's built-in
+stowed or offline, with live download, upload and latency, the last hour as two small graphs, every
+drop in the connection as it happens, and any alerts. It reads everything from Home Assistant's built-in
 [Starlink](https://www.home-assistant.io/integrations/starlink/) integration.
 
 ![The card with a Standard 4X dish](docs/online-standard-4x.png)
@@ -16,6 +16,8 @@ any alerts. It reads everything from Home Assistant's built-in
 | **Alerts.** Problems the dish reports show as amber chips and notices as blue ones (here a Mini that's obstructed, with an update ready). | **Snow melt.** While the dish is heating itself, it glows warm (here a Performance Gen 3). |
 | ![Sleeping](docs/sleeping-actuated.png) | ![On a phone](docs/phone-v5.png) |
 | **Sleeping.** In power-save, the dish goes grey and the dot turns blue (here a Standard Actuated). | **On a phone.** Everything is sized to the card's width (here a Starlink V5). |
+| ![Dropping out](docs/outages-standard-4x.png) | ![Dropped out now](docs/offline-now-standard-4x.png) |
+| **Outages.** Each drop as it happens: how many, how long offline, ping success over the graph's hour with the drops shaded, and the latest ones. | **Down now.** While the connection's down, the card counts the seconds. |
 
 ## Every Starlink dish
 
@@ -77,6 +79,7 @@ shows the wrong picture, set `model`.
 | The two graphs | Home Assistant's history of those sensors |
 | Alert chips | the obstructed, thermal throttling, motors stuck, mast not vertical, slow Ethernet, unexpected location, roaming and update sensors |
 | Ping drop, power | the ping drop rate and power sensors |
+| Outages: drops, time offline, ping success, the shaded graph and the latest drops | the connectivity sensor (its history, and each change as it happens), the ping drop rate's history, and the obstructed, sleep and stowed sensors (a drop while obstructed is marked; time asleep or stowed isn't counted) |
 
 Tap the dish, the status or any figure to open its details in Home Assistant.
 
@@ -85,7 +88,12 @@ Tap the dish, the status or any figure to open its details in Home Assistant.
 - **Only as fresh as the integration.** The figures update each time Home Assistant polls the dish.
 - **Throughput is what's flowing now,** not a speed test. A quiet connection shows a low number.
 - **The graphs need history.** If the Starlink sensors are excluded from Home Assistant's recorder,
-  the graphs stay empty.
+  the graphs stay empty, and outages only count from when the card was opened.
+- **Drops are as fine as the polling.** Home Assistant checks the dish every few seconds, so a drop
+  shorter than that can be missed, and each length is right to within a few seconds.
+- **No reasons for drops.** The integration doesn't say why the dish dropped out, so the card can't
+  show the causes the Starlink app does ("sky search", "unable to reach satellite"). It does mark a
+  drop that happened while the dish was obstructed.
 - **Kits that share a dish** look the same to the card (see above).
 - **The round dish's photo is smaller** than the others (Starlink only publishes it at 500 px), so
   it's a little softer on a large screen.
@@ -133,7 +141,9 @@ slot in a sections view, and works from about 360 px wide (a phone).
 |---|---|---|
 | `model` | `auto` | Which dish to show and the name under STARLINK (see Every Starlink dish). A name the card doesn't know is shown as you wrote it, with the detected dish. |
 | `device` | the first Starlink | Which Starlink, if you have more than one. The editor lists them; in YAML it's the device ID. |
-| `history_minutes` | `60` | How far back the graphs go, in minutes |
+| `history_minutes` | `60` | How far back the graphs go, in minutes (and the window for ping success) |
+| `show_outages` | `true` | Show the outages section |
+| `outage_hours` | `24` | How far back drops are counted and listed, in hours (up to 168) |
 | `entity_prefix` | | Only needed if the card can't find your dish: the part shared by its entity IDs, e.g. `starlink` for `binary_sensor.starlink_connectivity` |
 
 The card finds the Starlink's entities by what they are rather than by their entity IDs, so it
